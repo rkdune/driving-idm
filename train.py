@@ -29,7 +29,7 @@ image = (
     memory=32768,
     volumes={VOLUME_PATH: volume},
 )
-def train(run_name: str | None = None):
+def train(run_name: str | None = None, clear_cache: bool = False):
     import os
     import time
     import math
@@ -79,6 +79,14 @@ def train(run_name: str | None = None):
 
     npz_dir = os.path.join(VOLUME_PATH, "npz")
     os.makedirs(npz_dir, exist_ok=True)
+
+    # Optionally wipe the cache and re-download everything
+    if clear_cache:
+        print("Clearing volume cache...")
+        for fname in os.listdir(npz_dir):
+            os.remove(os.path.join(npz_dir, fname))
+        volume.commit()
+        print("Cache cleared.")
 
     # Only download files not already on the volume
     existing = set(os.listdir(npz_dir))
@@ -191,26 +199,30 @@ def train(run_name: str | None = None):
                               num_workers=NUM_WORKERS, pin_memory=True)
 
     # ── Model ────────────────────────────────────────────────────────────────
-    class ConvBlock(nn.Module):
+    class ResBlock(nn.Module):
         def __init__(self, in_ch, out_ch, stride=1):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+            self.bn1   = nn.BatchNorm2d(out_ch)
+            self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=1, padding=1, bias=False)
+            self.bn2   = nn.BatchNorm2d(out_ch)
+            self.skip  = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
+            ) if (stride != 1 or in_ch != out_ch) else nn.Identity()
+
         def forward(self, x):
-            return self.net(x)
+            return F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + self.skip(x))
 
     class IDM(nn.Module):
         """Lightweight IDM: (frame_t ‖ frame_t+1) → action_t (normalised)"""
         def __init__(self, action_dim=2):
             super().__init__()
             self.encoder = nn.Sequential(
-                ConvBlock(6,   32,  stride=2),   # 45×80
-                ConvBlock(32,  64,  stride=2),   # 23×40
-                ConvBlock(64,  128, stride=2),   # 12×20
-                ConvBlock(128, 256, stride=2),   #  6×10
+                ResBlock(6,   32,  stride=2),   # 45×80
+                ResBlock(32,  64,  stride=2),   # 23×40
+                ResBlock(64,  128, stride=2),   # 12×20
+                ResBlock(128, 256, stride=2),   #  6×10
                 nn.AdaptiveAvgPool2d((1, 1)),
             )
             self.head = nn.Sequential(
@@ -408,9 +420,9 @@ def train(run_name: str | None = None):
 
 
 @app.local_entrypoint()
-def main(run_name: str = ""):
+def main(run_name: str = "", clear_cache: bool = False):
     # Use spawn so the local process doesn't hold an open connection.
-    # Run with: modal run --detach train.py [--run-name my-run]
-    call = train.spawn(run_name=run_name or None)
+    # Run with: modal run --detach train.py [--run-name my-run] [--clear-cache]
+    call = train.spawn(run_name=run_name or None, clear_cache=clear_cache)
     print(f"Spawned function call: {call.object_id}")
     print("Track progress in the Modal dashboard or with: modal app logs idm-training")
