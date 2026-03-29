@@ -62,12 +62,13 @@ def build_idm():
                 ResBlock(32,  64,  stride=2),
                 ResBlock(64,  128, stride=2),
                 ResBlock(128, 256, stride=2),
+                ResBlock(256, 512, stride=1),   # deeper before pooling
                 nn.AdaptiveAvgPool2d((1, 1)),
             )
             self.head = nn.Sequential(
-                nn.Linear(256, 128),
+                nn.Linear(512, 256),
                 nn.ReLU(inplace=True),
-                nn.Linear(128, action_dim),
+                nn.Linear(256, action_dim),
             )
         def forward(self, x):
             return self.head(self.encoder(x).flatten(1))

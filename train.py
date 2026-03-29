@@ -21,15 +21,16 @@ image = (
 @app.function(
     image=image,
     gpu="H100",
+    cpu=64,
     timeout=3600 * 4,
     secrets=[
         modal.Secret.from_name("huggingface-secret"),
         modal.Secret.from_name("wandb-secret"),
     ],
-    memory=32768,
+    memory=131072,
     volumes={VOLUME_PATH: volume},
 )
-def train(run_name: str | None = None, clear_cache: bool = False):
+def train(run_name: str | None = None, clear_cache: bool = False, curvature_comma: bool = False, diff_siamese: bool = False):
     import os
     import time
     import math
@@ -39,18 +40,19 @@ def train(run_name: str | None = None, clear_cache: bool = False):
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
     from huggingface_hub import hf_hub_download, list_repo_files
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     import wandb
     from tqdm import tqdm
 
     # ── Config ───────────────────────────────────────────────────────────────
-    REPO_ID = "nebusoku14/comm_hack_parking_npz"
+    REPO_ID = "nebusoku14/comm_hack_parking_day" if curvature_comma else "nebusoku14/comm_hack_parking_npz"
     IMG_H, IMG_W = 90, 160
     BATCH_SIZE = 128           # bigger batch for H100
     LR = 3e-4
     EPOCHS = 1
     NUM_WORKERS = 4
     LOG_EVERY     = 50         # steps between per-step train wandb logs
-    VAL_LOG_EVERY = 100        # steps between mid-epoch val probes
+    VAL_LOG_EVERY = 50         # steps between mid-epoch val probes
     VAL_PROBE_BATCHES = 20     # how many val batches to sample for the probe
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -61,12 +63,24 @@ def train(run_name: str | None = None, clear_cache: bool = False):
             img_h=IMG_H, img_w=IMG_W,
             batch_size=BATCH_SIZE, lr=LR, epochs=EPOCHS,
             log_every=LOG_EVERY,
-            model="lightweight-cnn-idm",
+            model="diff-siamese-idm" if diff_siamese else "resnet-idm",
             dataset=REPO_ID,
             gpu="H100",
         ),
     )
     print(f"wandb run: {run.url}")
+    print(
+        f"\n{'='*60}\n"
+        f"  DATASET:      {REPO_ID}\n"
+        f"  MODEL:        {'DIFF-SIAMESE-IDM' if diff_siamese else 'RESNET-IDM'}\n"
+        f"  BATCH SIZE:   {BATCH_SIZE}\n"
+        f"  LR:           {LR}\n"
+        f"  EPOCHS:       {EPOCHS}\n"
+        f"  IMG:          {IMG_H}x{IMG_W}\n"
+        f"  CURVATURE:    {curvature_comma}\n"
+        f"  DIFF_SIAMESE: {diff_siamese}\n"
+        f"{'='*60}\n"
+    )
 
     # ── Download dataset ─────────────────────────────────────────────────────
     print("Listing dataset files...")
@@ -84,7 +98,9 @@ def train(run_name: str | None = None, clear_cache: bool = False):
     if clear_cache:
         print("Clearing volume cache...")
         for fname in os.listdir(npz_dir):
-            os.remove(os.path.join(npz_dir, fname))
+            fpath = os.path.join(npz_dir, fname)
+            if os.path.isfile(fpath):
+                os.remove(fpath)
         volume.commit()
         print("Cache cleared.")
 
@@ -94,16 +110,27 @@ def train(run_name: str | None = None, clear_cache: bool = False):
     print(f"Already cached: {len(existing)}  |  To download: {len(to_download)}")
 
     t0 = time.time()
-    local_paths = []
     if to_download:
-        for fname in tqdm(to_download, desc="download"):
-            hf_hub_download(
-                repo_id=REPO_ID,
-                filename=fname,
-                repo_type="dataset",
-                local_dir=npz_dir,
-            )
-        volume.commit()  # flush new files to the volume
+        tmp_dir = "/tmp/npz_staging"
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        def _download(fname):
+            hf_hub_download(repo_id=REPO_ID, filename=fname,
+                            repo_type="dataset", local_dir=tmp_dir)
+            return fname
+
+        with ThreadPoolExecutor(max_workers=64) as ex:
+            futures = {ex.submit(_download, f): f for f in to_download}
+            for fut in tqdm(as_completed(futures), total=len(to_download), desc="download"):
+                fut.result()
+
+        print("Moving files to volume...")
+        import shutil
+        for fname in to_download:
+            src = os.path.join(tmp_dir, os.path.basename(fname))
+            dst = os.path.join(npz_dir, os.path.basename(fname))
+            shutil.move(src, dst)
+        volume.commit()
         print(f"Download done in {time.time() - t0:.1f}s")
     else:
         print("All files already cached, skipping download.")
@@ -112,17 +139,26 @@ def train(run_name: str | None = None, clear_cache: bool = False):
 
     # ── Preload into RAM ─────────────────────────────────────────────────────
     print("Loading npz files into RAM...")
-    all_frames = []
-    all_actions = []
-    skipped = 0
-    for p in tqdm(local_paths, desc="load"):
+
+    def _load(p):
         try:
             data = np.load(p)
-            all_frames.append(data["frames"])    # (T, H, W, 3) uint8
-            all_actions.append(data["actions"])  # (T, 2) float32
+            return data["frames"], data["actions"]
         except Exception as e:
-            print(f"  skip {os.path.basename(p)}: {e}")
+            return None, str(e)
+
+    with ThreadPoolExecutor(max_workers=64) as ex:
+        results = list(tqdm(ex.map(_load, local_paths), total=len(local_paths), desc="load"))
+
+    all_frames, all_actions, skipped = [], [], 0
+    for p, (frames, actions) in zip(local_paths, results):
+        if frames is None:
+            print(f"  skip {os.path.basename(p)}: {actions}")
             skipped += 1
+        else:
+            all_frames.append(frames)
+            all_actions.append(actions)
+
     frame_counts = [f.shape[0] for f in all_frames]
     print(f"Loaded {len(all_frames)} files ({skipped} skipped)")
     print(f"Frames per file — min: {min(frame_counts)}  max: {max(frame_counts)}  "
@@ -181,10 +217,15 @@ def train(run_name: str | None = None, clear_cache: bool = False):
             y = (torch.from_numpy(act.copy()) - self.act_mean) / self.act_std
             return x, y
 
-    # 90/10 split by file
-    split = int(0.9 * len(all_frames))
-    train_idx = [(fi, t) for fi, t in sample_index if fi < split]
-    val_idx   = [(fi, t) for fi, t in sample_index if fi >= split]
+    # 90/10 split by file (shuffled so val isn't just the last N files)
+    rng = np.random.default_rng()
+    file_indices = np.arange(len(all_frames))
+    rng.shuffle(file_indices)
+    split = int(0.9 * len(file_indices))
+    train_files = set(file_indices[:split].tolist())
+    val_files   = set(file_indices[split:].tolist())
+    train_idx = [(fi, t) for fi, t in sample_index if fi in train_files]
+    val_idx   = [(fi, t) for fi, t in sample_index if fi in val_files]
 
     train_ds = IDMDataset(train_idx, all_frames, all_actions,
                           IMG_H, IMG_W, act_mean, act_std)
@@ -215,7 +256,7 @@ def train(run_name: str | None = None, clear_cache: bool = False):
             return F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x))))) + self.skip(x))
 
     class IDM(nn.Module):
-        """Lightweight IDM: (frame_t ‖ frame_t+1) → action_t (normalised)"""
+        """Stacked-frame IDM: (frame_t ‖ frame_t+1) → action_t (normalised)"""
         def __init__(self, action_dim=2):
             super().__init__()
             self.encoder = nn.Sequential(
@@ -223,18 +264,44 @@ def train(run_name: str | None = None, clear_cache: bool = False):
                 ResBlock(32,  64,  stride=2),   # 23×40
                 ResBlock(64,  128, stride=2),   # 12×20
                 ResBlock(128, 256, stride=2),   #  6×10
+                ResBlock(256, 512, stride=1),   #  6×10  deeper before pooling
                 nn.AdaptiveAvgPool2d((1, 1)),
             )
             self.head = nn.Sequential(
-                nn.Linear(256, 128),
+                nn.Linear(512, 256),
                 nn.ReLU(inplace=True),
-                nn.Linear(128, action_dim),
+                nn.Linear(256, action_dim),
             )
 
         def forward(self, x):
             return self.head(self.encoder(x).flatten(1))
 
-    model = IDM(action_dim=2).to(DEVICE)
+    class IDMSiamese(nn.Module):
+        """Siamese IDM: f0 and f1 encoded with shared weights.
+        Head sees [z0, z1, z1-z0] — explicit feature-level diff signal."""
+        def __init__(self, action_dim=2):
+            super().__init__()
+            self.encoder = nn.Sequential(
+                ResBlock(3,   32,  stride=2),   # 45×80
+                ResBlock(32,  64,  stride=2),   # 23×40
+                ResBlock(64,  128, stride=2),   # 12×20
+                ResBlock(128, 256, stride=2),   #  6×10
+                ResBlock(256, 512, stride=1),   #  6×10  deeper before pooling
+                nn.AdaptiveAvgPool2d((1, 1)),
+            )
+            self.head = nn.Sequential(
+                nn.Linear(512 * 3, 256),        # z0, z1, z1-z0
+                nn.ReLU(inplace=True),
+                nn.Linear(256, action_dim),
+            )
+
+        def forward(self, x):
+            f0, f1 = x[:, :3], x[:, 3:]
+            z0 = self.encoder(f0).flatten(1)
+            z1 = self.encoder(f1).flatten(1)
+            return self.head(torch.cat([z0, z1, z1 - z0], dim=1))
+
+    model = (IDMSiamese(action_dim=2) if diff_siamese else IDM(action_dim=2)).to(DEVICE)
     # Use torch.compile on H100 for speed
     model = torch.compile(model)
     wandb.watch(model, log="all", log_freq=LOG_EVERY)
@@ -420,9 +487,9 @@ def train(run_name: str | None = None, clear_cache: bool = False):
 
 
 @app.local_entrypoint()
-def main(run_name: str = "", clear_cache: bool = False):
+def main(run_name: str = "", clear_cache: bool = False, curvature_comma: bool = False, diff_siamese: bool = False):
     # Use spawn so the local process doesn't hold an open connection.
-    # Run with: modal run --detach train.py [--run-name my-run] [--clear-cache]
-    call = train.spawn(run_name=run_name or None, clear_cache=clear_cache)
+    # Run with: modal run --detach train.py [--run-name my-run] [--clear-cache] [--curvature-comma] [--diff-siamese]
+    call = train.spawn(run_name=run_name or None, clear_cache=clear_cache, curvature_comma=curvature_comma, diff_siamese=diff_siamese)
     print(f"Spawned function call: {call.object_id}")
     print("Track progress in the Modal dashboard or with: modal app logs idm-training")
